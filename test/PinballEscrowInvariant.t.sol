@@ -275,6 +275,7 @@ contract PinballEscrowInvariantTest is EscrowTestBase {
         targetContract(address(handler));
     }
 
+    /// forge-config: default.invariant.fail-on-revert = true
     function invariant_StateAndBalancesAlwaysMatchTheIndependentModel() public view {
         handler.checkModelAndConservation();
     }
