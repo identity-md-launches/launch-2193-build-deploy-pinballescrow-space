@@ -11,11 +11,10 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 
 /// @title PinballEscrow
 /// @notice Two-player Space Pinball stakes, settled by NIGHTSHIFT's signed replay result.
-/// @dev The owner is fixed and has only signer rotation and open-pause powers. Match IDs are never reused.
+/// @dev The owner is immutable and has only signer rotation and open-pause powers. Match IDs are never reused.
 contract PinballEscrow is EIP712, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
-    address public constant owner = 0x6C4c78f2C3bDf4C4318Fe305FB1C8BC1694d19b5;
     address public constant IMD = 0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7;
     address public constant SHIFT = 0xE5e58E53d0Bb204Aa62c995A6c8CC8a48e60C3AC;
     address public constant FEE_RECIPIENT = 0x1119d5Df2f046bC2d3c0F6279EF2E9cE49422d44;
@@ -34,20 +33,25 @@ contract PinballEscrow is EIP712, Pausable, ReentrancyGuard {
         Refunded
     }
 
+    // `invitee` is the only address allowed to join, or address(0) when any other player may join.
     struct Match {
         address token;
         uint256 stake;
         address playerA;
         address playerB;
+        address invitee;
         uint256 openedAt;
         uint256 joinedAt;
         State state;
     }
 
+    /// @notice Fixed at deployment from the constructor argument the launch fills with its owner.
+    address public immutable owner;
     address public signer;
     mapping(bytes32 matchId => Match) private _matches;
 
     event Opened(bytes32 indexed matchId, address indexed token, uint256 stake, address indexed playerA);
+    event Invited(bytes32 indexed matchId, address indexed invitee);
     event Joined(bytes32 indexed matchId, address indexed playerB);
     /// @param payout Total amount paid to players: winner payout, or both refunds combined for a draw.
     event Settled(bytes32 indexed matchId, address indexed winner, bool draw, uint256 payout, uint256 fee);
@@ -55,13 +59,16 @@ contract PinballEscrow is EIP712, Pausable, ReentrancyGuard {
     event SignerUpdated(address indexed previousSigner, address indexed newSigner);
 
     error Unauthorized();
-    error InvalidInitialSigner();
+    error InvalidOwner();
     error InvalidSigner();
     error UnsupportedToken();
     error InvalidStake();
     error MatchAlreadyExists();
     error InvalidState();
     error CannotJoinOwnMatch();
+    error InvalidInvitee();
+    error NotInvited();
+    error MatchMismatch();
     error JoinWindowClosed();
     error SettlementWindowClosed();
     error RefundNotReady();
@@ -75,10 +82,13 @@ contract PinballEscrow is EIP712, Pausable, ReentrancyGuard {
         _;
     }
 
-    /// @param initialSigner Must equal the fixed launch owner; the owner may rotate it after launch.
+    /// @param owner_ The launch owner. Never derived from msg.sender (the factory) or tx.origin.
+    /// @param initialSigner The first result signer; the launch fills it with the same owner address.
     /// @dev Does not call other contracts, so construction also works on an empty chain.
-    constructor(address initialSigner) EIP712("SpacePinball", "1") {
-        if (initialSigner != owner) revert InvalidInitialSigner();
+    constructor(address owner_, address initialSigner) EIP712("SpacePinball", "1") {
+        if (owner_ == address(0)) revert InvalidOwner();
+        if (initialSigner == address(0)) revert InvalidSigner();
+        owner = owner_;
         signer = initialSigner;
         emit SignerUpdated(address(0), initialSigner);
     }
@@ -97,38 +107,37 @@ contract PinballEscrow is EIP712, Pausable, ReentrancyGuard {
         return false;
     }
 
-    /// @notice Deposits player A's stake. Any bytes32 ID is valid, but can be opened only once.
+    /// @notice Deposits player A's stake into a match any other player may join.
+    /// @dev Any bytes32 ID is valid, but can be opened only once.
     function open(bytes32 matchId, address token, uint256 stake) external nonReentrant whenNotPaused {
-        if (_matches[matchId].state != State.None) revert MatchAlreadyExists();
-        if (token != IMD && token != SHIFT) revert UnsupportedToken();
-        if (!isAllowedStake(token, stake)) revert InvalidStake();
+        _open(matchId, token, stake, address(0));
+    }
 
-        _matches[matchId] = Match({
-            token: token,
-            stake: stake,
-            playerA: msg.sender,
-            playerB: address(0),
-            openedAt: block.timestamp,
-            joinedAt: 0,
-            state: State.Open
-        });
-        emit Opened(matchId, token, stake, msg.sender);
-        _deposit(token, msg.sender, stake);
+    /// @notice Deposits player A's stake into a match only `invitee` may join.
+    /// @dev Closes the slot-sniping race: a third party cannot take player B's place before the invitee.
+    function openInvite(bytes32 matchId, address token, uint256 stake, address invitee)
+        external
+        nonReentrant
+        whenNotPaused
+    {
+        if (invitee == address(0) || invitee == msg.sender) revert InvalidInvitee();
+        _open(matchId, token, stake, invitee);
     }
 
     /// @notice Deposits player B's matching stake before the one-hour join window closes.
-    /// @dev Existing opens can be joined while paused. The first eligible joiner becomes player B.
+    /// @dev Existing opens can be joined while paused. The first eligible joiner becomes player B. The caller
+    /// deposits whatever the ID currently holds; use joinChecked to assert the agreed token, stake and opponent.
     function join(bytes32 matchId) external nonReentrant {
+        _join(matchId);
+    }
+
+    /// @notice Joins only if the match holds exactly the agreed token, stake and player A.
+    /// @dev Closes the ID-squatting race: a front-run open with another tier or opener cannot bind the caller.
+    function joinChecked(bytes32 matchId, address token, uint256 stake, address playerA) external nonReentrant {
         Match storage game = _matches[matchId];
         if (game.state != State.Open) revert InvalidState();
-        if (msg.sender == game.playerA) revert CannotJoinOwnMatch();
-        if (block.timestamp >= game.openedAt + JOIN_WINDOW) revert JoinWindowClosed();
-
-        game.playerB = msg.sender;
-        game.joinedAt = block.timestamp;
-        game.state = State.Joined;
-        emit Joined(matchId, msg.sender);
-        _deposit(game.token, msg.sender, game.stake);
+        if (game.token != token || game.stake != stake || game.playerA != playerA) revert MatchMismatch();
+        _join(matchId);
     }
 
     /// @notice Anyone may relay the current signer's result before the settlement timeout.
@@ -203,6 +212,40 @@ contract PinballEscrow is EIP712, Pausable, ReentrancyGuard {
     /// @notice EIP-712 digest that the server signs, including this contract and the current chain ID.
     function hashResult(bytes32 matchId, address winner, bool draw, uint256 deadline) public view returns (bytes32) {
         return _hashTypedDataV4(keccak256(abi.encode(RESULT_TYPEHASH, matchId, winner, draw, deadline)));
+    }
+
+    function _open(bytes32 matchId, address token, uint256 stake, address invitee) private {
+        if (_matches[matchId].state != State.None) revert MatchAlreadyExists();
+        if (token != IMD && token != SHIFT) revert UnsupportedToken();
+        if (!isAllowedStake(token, stake)) revert InvalidStake();
+
+        _matches[matchId] = Match({
+            token: token,
+            stake: stake,
+            playerA: msg.sender,
+            playerB: address(0),
+            invitee: invitee,
+            openedAt: block.timestamp,
+            joinedAt: 0,
+            state: State.Open
+        });
+        emit Opened(matchId, token, stake, msg.sender);
+        if (invitee != address(0)) emit Invited(matchId, invitee);
+        _deposit(token, msg.sender, stake);
+    }
+
+    function _join(bytes32 matchId) private {
+        Match storage game = _matches[matchId];
+        if (game.state != State.Open) revert InvalidState();
+        if (msg.sender == game.playerA) revert CannotJoinOwnMatch();
+        if (game.invitee != address(0) && msg.sender != game.invitee) revert NotInvited();
+        if (block.timestamp >= game.openedAt + JOIN_WINDOW) revert JoinWindowClosed();
+
+        game.playerB = msg.sender;
+        game.joinedAt = block.timestamp;
+        game.state = State.Joined;
+        emit Joined(matchId, msg.sender);
+        _deposit(game.token, msg.sender, game.stake);
     }
 
     function _deposit(address token, address player, uint256 stake) private {

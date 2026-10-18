@@ -30,7 +30,7 @@ abstract contract EscrowTestBase is Test {
         charlie = makeAddr("third player");
         relayer = makeAddr("permissionless relayer");
         resultSigner = vm.addr(SIGNER_KEY);
-        escrow = new PinballEscrow(OWNER);
+        escrow = new PinballEscrow(OWNER, OWNER);
         vm.prank(OWNER);
         escrow.setSigner(resultSigner);
 

@@ -19,6 +19,7 @@ contract EscrowHandler is Test {
         uint256 stake;
         address playerA;
         address playerB;
+        address invitee;
         uint256 openedAt;
         uint256 joinedAt;
         ModelState state;
@@ -58,33 +59,86 @@ contract EscrowHandler is Test {
     }
 
     function openMatch(uint8 idSeed, uint8 tokenSeed, uint8 tier, uint8 actorSeed, bool validStake) public {
-        uint256 index = idSeed % MATCH_COUNT;
-        ModelMatch storage model = games[index];
-        address token = tokenSeed % 3 == 2 ? address(this) : tokens[tokenSeed % 3];
-        uint256[4] memory imd = [uint256(1e18), 5e18, 10e18, 25e18];
-        uint256[4] memory shift = [uint256(100_000e18), 500_000e18, 1_000_000e18, 5_000_000e18];
-        uint256 stake = validStake ? (token == tokens[0] ? imd[tier % 4] : shift[tier % 4]) : uint256(tier);
-        address player = actors[actorSeed % 3];
-        bool expected = model.state == ModelState.None && !opensPaused && token != address(this) && validStake;
-        vm.prank(player);
-        (bool ok,) = address(escrow).call(abi.encodeCall(escrow.open, (_id(index), token, stake)));
-        _checkOutcome(ok, expected);
-        if (!ok) return;
-        games[index] = ModelMatch(token, stake, player, address(0), vm.getBlockTimestamp(), 0, ModelState.Open);
-        balances[token][player] -= stake;
-        ++successfulOpens;
+        _openModel(idSeed, tokenSeed, tier, actorSeed, validStake, 3);
+    }
+
+    /// @param inviteeSeed 0..2 invites an actor (possibly the opener, which must fail); 3 invites address(0).
+    function openInviteMatch(uint8 idSeed, uint8 tokenSeed, uint8 tier, uint8 actorSeed, uint8 inviteeSeed) public {
+        _openModel(idSeed, tokenSeed, tier, actorSeed, true, inviteeSeed % 4);
     }
 
     function joinMatch(uint8 idSeed, uint8 actorSeed) public {
         uint256 index = idSeed % MATCH_COUNT;
         ModelMatch storage model = games[index];
         address player = actors[actorSeed % 3];
-        bool expected =
-            model.state == ModelState.Open && player != model.playerA && vm.getBlockTimestamp() < model.openedAt + 3600;
+        bool expected = _joinAllowed(model, player);
         vm.prank(player);
         (bool ok,) = address(escrow).call(abi.encodeCall(escrow.join, (_id(index))));
         _checkOutcome(ok, expected);
         if (!ok) return;
+        _recordJoin(model, player);
+    }
+
+    /// @param mismatch 0 asserts the recorded terms; 1..3 misstate the token, stake or opener respectively.
+    function joinCheckedMatch(uint8 idSeed, uint8 actorSeed, uint8 mismatch) public {
+        uint256 index = idSeed % MATCH_COUNT;
+        ModelMatch storage model = games[index];
+        address player = actors[actorSeed % 3];
+        uint256 kind = mismatch % 4;
+        address token = kind == 1 ? (model.token == tokens[0] ? tokens[1] : tokens[0]) : model.token;
+        uint256 stake = kind == 2 ? model.stake + 1 : model.stake;
+        address playerA = kind == 3 ? address(this) : model.playerA;
+        bool expected = kind == 0 && _joinAllowed(model, player);
+        vm.prank(player);
+        (bool ok,) = address(escrow).call(abi.encodeCall(escrow.joinChecked, (_id(index), token, stake, playerA)));
+        _checkOutcome(ok, expected);
+        if (!ok) return;
+        _recordJoin(model, player);
+    }
+
+    /// @dev inviteKind 3 is a public open; 0..2 invite that actor. Inviting yourself must fail.
+    function _openModel(uint8 idSeed, uint8 tokenSeed, uint8 tier, uint8 actorSeed, bool validStake, uint256 inviteKind)
+        private
+    {
+        uint256 index = idSeed % MATCH_COUNT;
+        address token = tokenSeed % 3 == 2 ? address(this) : tokens[tokenSeed % 3];
+        uint256 stake = _stakeFor(token, tier, validStake);
+        address player = actors[actorSeed % 3];
+        address invitee = inviteKind == 3 ? address(0) : actors[inviteKind];
+        bool expected = games[index].state == ModelState.None && !opensPaused && token != address(this) && validStake
+            && invitee != player;
+        vm.prank(player);
+        (bool ok,) = address(escrow).call(_openCalldata(index, token, stake, invitee));
+        _checkOutcome(ok, expected);
+        if (!ok) return;
+        games[index] = ModelMatch(token, stake, player, address(0), invitee, vm.getBlockTimestamp(), 0, ModelState.Open);
+        balances[token][player] -= stake;
+        ++successfulOpens;
+    }
+
+    function _stakeFor(address token, uint256 tier, bool validStake) private view returns (uint256) {
+        if (!validStake) return tier;
+        uint256[4] memory imd = [uint256(1e18), 5e18, 10e18, 25e18];
+        uint256[4] memory shift = [uint256(100_000e18), 500_000e18, 1_000_000e18, 5_000_000e18];
+        return token == tokens[0] ? imd[tier % 4] : shift[tier % 4];
+    }
+
+    function _openCalldata(uint256 index, address token, uint256 stake, address invitee)
+        private
+        view
+        returns (bytes memory)
+    {
+        if (invitee == address(0)) return abi.encodeCall(escrow.open, (_id(index), token, stake));
+        return abi.encodeCall(escrow.openInvite, (_id(index), token, stake, invitee));
+    }
+
+    function _joinAllowed(ModelMatch storage model, address player) private view returns (bool) {
+        return model.state == ModelState.Open && player != model.playerA
+            && (model.invitee == address(0) || player == model.invitee)
+            && vm.getBlockTimestamp() < model.openedAt + 3600;
+    }
+
+    function _recordJoin(ModelMatch storage model, address player) private {
         model.playerB = player;
         model.joinedAt = vm.getBlockTimestamp();
         model.state = ModelState.Joined;
@@ -178,6 +232,7 @@ contract EscrowHandler is Test {
             assertEq(actual.stake, model.stake, "stake model");
             assertEq(actual.playerA, model.playerA, "A model");
             assertEq(actual.playerB, model.playerB, "B model");
+            assertEq(actual.invitee, model.invitee, "invitee model");
             assertEq(actual.openedAt, model.openedAt, "open time model");
             assertEq(actual.joinedAt, model.joinedAt, "join time model");
             if (model.state == ModelState.Open || model.state == ModelState.Joined) {
@@ -262,7 +317,10 @@ contract PinballEscrowInvariantTest is EscrowTestBase {
         handler.joinMatch(1, 0);
         handler.openMatch(2, 0, 3, 1, true);
         handler.openMatch(3, 1, 1, 0, true);
-        bytes4[] memory selectors = new bytes4[](8);
+        handler.openInviteMatch(4, 0, 2, 0, 1);
+        handler.joinCheckedMatch(4, 1, 0);
+        handler.openInviteMatch(5, 1, 0, 2, 0);
+        bytes4[] memory selectors = new bytes4[](10);
         selectors[0] = EscrowHandler.openMatch.selector;
         selectors[1] = EscrowHandler.joinMatch.selector;
         selectors[2] = EscrowHandler.settleMatch.selector;
@@ -271,6 +329,8 @@ contract PinballEscrowInvariantTest is EscrowTestBase {
         selectors[5] = EscrowHandler.togglePause.selector;
         selectors[6] = EscrowHandler.rotateSigner.selector;
         selectors[7] = EscrowHandler.donate.selector;
+        selectors[8] = EscrowHandler.openInviteMatch.selector;
+        selectors[9] = EscrowHandler.joinCheckedMatch.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
         targetContract(address(handler));
     }

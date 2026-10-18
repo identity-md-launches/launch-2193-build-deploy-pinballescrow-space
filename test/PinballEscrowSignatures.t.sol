@@ -105,7 +105,7 @@ contract PinballEscrowSignaturesTest is EscrowTestBase {
     }
 
     function test_CannotReplayAcrossContracts() public {
-        PinballEscrow other = new PinballEscrow(OWNER);
+        PinballEscrow other = new PinballEscrow(OWNER, OWNER);
         vm.prank(OWNER);
         other.setSigner(resultSigner);
         _openJoined(ID, IMD, 1e18);

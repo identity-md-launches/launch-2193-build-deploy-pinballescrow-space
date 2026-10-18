@@ -5,13 +5,14 @@ import {EscrowTestBase, PinballEscrow, MockToken} from "./helpers/EscrowTestBase
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 
 contract PinballFactoryProbe {
-    function deploy(address initialSigner, bytes32 salt) external returns (PinballEscrow) {
-        return new PinballEscrow{salt: salt}(initialSigner);
+    function deploy(address owner_, address initialSigner, bytes32 salt) external returns (PinballEscrow) {
+        return new PinballEscrow{salt: salt}(owner_, initialSigner);
     }
 }
 
 contract PinballEscrowTest is EscrowTestBase {
     event Opened(bytes32 indexed matchId, address indexed token, uint256 stake, address indexed playerA);
+    event Invited(bytes32 indexed matchId, address indexed invitee);
     event Joined(bytes32 indexed matchId, address indexed playerB);
     event Settled(bytes32 indexed matchId, address indexed winner, bool draw, uint256 payout, uint256 fee);
     event Refunded(bytes32 indexed matchId);
@@ -27,8 +28,8 @@ contract PinballEscrowTest is EscrowTestBase {
         bytes32 salt = keccak256("factory launch rehearsal");
         vm.expectEmit(true, true, false, true);
         emit SignerUpdated(address(0), OWNER);
-        PinballEscrow deployed = factory.deploy(OWNER, salt);
-        bytes32 initCodeHash = keccak256(abi.encodePacked(type(PinballEscrow).creationCode, abi.encode(OWNER)));
+        PinballEscrow deployed = factory.deploy(OWNER, OWNER, salt);
+        bytes32 initCodeHash = keccak256(abi.encodePacked(type(PinballEscrow).creationCode, abi.encode(OWNER, OWNER)));
         address predicted =
             address(uint160(uint256(keccak256(abi.encodePacked(hex"ff", address(factory), salt, initCodeHash)))));
         assertEq(address(deployed), predicted);
@@ -49,11 +50,34 @@ contract PinballEscrowTest is EscrowTestBase {
         deployed.pause();
     }
 
-    function test_ConstructorRejectsIncorrectOrZeroInitialSigner() public {
-        vm.expectRevert(PinballEscrow.InvalidInitialSigner.selector);
-        new PinballEscrow(address(0));
-        vm.expectRevert(PinballEscrow.InvalidInitialSigner.selector);
-        new PinballEscrow(resultSigner);
+    /// @dev The launch fills the owner argument; owner() must follow it, never the factory or the origin.
+    function testFuzz_OwnerFollowsConstructorArgumentNotDeployerOrOrigin(address launchOwner, address origin) public {
+        vm.assume(launchOwner != address(0) && origin != address(0));
+        vm.assume(launchOwner != address(vm) && origin != address(vm) && uint160(origin) > 0xff);
+        PinballFactoryProbe factory = new PinballFactoryProbe();
+        vm.assume(launchOwner != address(factory) && launchOwner != origin);
+        vm.prank(origin, origin);
+        PinballEscrow deployed = factory.deploy(launchOwner, launchOwner, keccak256("owner probe"));
+        assertEq(deployed.owner(), launchOwner);
+        assertEq(deployed.signer(), launchOwner);
+        assertNotEq(deployed.owner(), address(factory));
+        assertNotEq(deployed.owner(), origin);
+        vm.prank(address(factory));
+        vm.expectRevert(PinballEscrow.Unauthorized.selector);
+        deployed.setSigner(address(factory));
+        vm.prank(origin);
+        vm.expectRevert(PinballEscrow.Unauthorized.selector);
+        deployed.pause();
+        vm.prank(launchOwner);
+        deployed.pause();
+        assertTrue(deployed.paused());
+    }
+
+    function test_ConstructorRejectsZeroOwnerOrZeroInitialSigner() public {
+        vm.expectRevert(PinballEscrow.InvalidOwner.selector);
+        new PinballEscrow(address(0), OWNER);
+        vm.expectRevert(PinballEscrow.InvalidSigner.selector);
+        new PinballEscrow(OWNER, address(0));
     }
 
     function test_RuntimeMeetsProtectedOpcodeAndSizeFloor() public view {
@@ -198,6 +222,152 @@ contract PinballEscrowTest is EscrowTestBase {
         escrow.join(ID);
         assertEq(MockToken(IMD).balanceOf(address(escrow)), 2e18);
         assertEq(MockToken(IMD).balanceOf(charlie), START_BALANCE);
+    }
+
+    /// @dev Finding cc82eb10, squat variant: a front-run open with another tier must not bind the checked joiner.
+    function test_SquattedIdCannotChangeACheckedJoinersTokenOrStake() public {
+        address mallory = charlie;
+        vm.prank(mallory);
+        escrow.open(ID, SHIFT, 5_000_000e18);
+        vm.expectRevert(PinballEscrow.MatchAlreadyExists.selector);
+        _open(ID, IMD, 1e18);
+        vm.prank(bob);
+        vm.expectRevert(PinballEscrow.MatchMismatch.selector);
+        escrow.joinChecked(ID, IMD, 1e18, alice);
+        assertEq(MockToken(IMD).balanceOf(bob), START_BALANCE);
+        assertEq(MockToken(SHIFT).balanceOf(bob), START_BALANCE);
+        assertEq(escrow.matches(ID).playerB, address(0));
+        _assertState(ID, PinballEscrow.State.Open);
+        // The squatter only locks their own stake and recovers it after the join window.
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        escrow.refund(ID);
+        assertEq(MockToken(SHIFT).balanceOf(mallory), START_BALANCE);
+    }
+
+    function test_JoinCheckedRejectsEveryMismatchAndAcceptsTheExactMatch() public {
+        _open(ID, IMD, 5e18);
+        vm.startPrank(bob);
+        vm.expectRevert(PinballEscrow.MatchMismatch.selector);
+        escrow.joinChecked(ID, SHIFT, 5e18, alice);
+        vm.expectRevert(PinballEscrow.MatchMismatch.selector);
+        escrow.joinChecked(ID, IMD, 1e18, alice);
+        vm.expectRevert(PinballEscrow.MatchMismatch.selector);
+        escrow.joinChecked(ID, IMD, 5e18, charlie);
+        vm.expectRevert(PinballEscrow.InvalidState.selector);
+        escrow.joinChecked(keccak256("never opened"), IMD, 5e18, alice);
+        vm.stopPrank();
+        vm.prank(alice);
+        vm.expectRevert(PinballEscrow.CannotJoinOwnMatch.selector);
+        escrow.joinChecked(ID, IMD, 5e18, alice);
+        vm.expectEmit(true, true, false, true, address(escrow));
+        emit Joined(ID, bob);
+        vm.prank(bob);
+        escrow.joinChecked(ID, IMD, 5e18, alice);
+        _assertState(ID, PinballEscrow.State.Joined);
+        assertEq(escrow.matches(ID).playerB, bob);
+        assertEq(MockToken(IMD).balanceOf(address(escrow)), 10e18);
+        vm.prank(charlie);
+        vm.expectRevert(PinballEscrow.InvalidState.selector);
+        escrow.joinChecked(ID, IMD, 5e18, alice);
+        _settle(ID, bob, false);
+    }
+
+    function testFuzz_JoinCheckedBindsOnlyTheExactParameters(
+        bool shift,
+        uint8 tier,
+        address token,
+        uint256 stake,
+        address playerA
+    ) public {
+        address realToken = shift ? SHIFT : IMD;
+        uint256 realStake = _stake(shift, tier);
+        _open(ID, realToken, realStake);
+        bool exact = token == realToken && stake == realStake && playerA == alice;
+        vm.prank(bob);
+        if (!exact) vm.expectRevert(PinballEscrow.MatchMismatch.selector);
+        escrow.joinChecked(ID, token, stake, playerA);
+        assertEq(MockToken(realToken).balanceOf(bob), exact ? START_BALANCE - realStake : START_BALANCE);
+        assertEq(escrow.matches(ID).playerB, exact ? bob : address(0));
+    }
+
+    /// @dev Finding cc82eb10, slot-snipe variant: an invite-only open keeps the arranged opponent.
+    function test_InviteOnlyMatchRejectsSlotSnipersAndSettlesForTheInvitee() public {
+        vm.expectEmit(true, true, true, true, address(escrow));
+        emit Opened(ID, IMD, 25e18, alice);
+        vm.expectEmit(true, true, false, true, address(escrow));
+        emit Invited(ID, bob);
+        vm.prank(alice);
+        escrow.openInvite(ID, IMD, 25e18, bob);
+        PinballEscrow.Match memory game = escrow.matches(ID);
+        assertEq(game.invitee, bob);
+        assertEq(game.playerA, alice);
+        _assertState(ID, PinballEscrow.State.Open);
+        vm.startPrank(charlie);
+        vm.expectRevert(PinballEscrow.NotInvited.selector);
+        escrow.join(ID);
+        vm.expectRevert(PinballEscrow.NotInvited.selector);
+        escrow.joinChecked(ID, IMD, 25e18, alice);
+        vm.stopPrank();
+        vm.prank(alice);
+        vm.expectRevert(PinballEscrow.CannotJoinOwnMatch.selector);
+        escrow.join(ID);
+        assertEq(escrow.matches(ID).playerB, address(0));
+        assertEq(MockToken(IMD).balanceOf(charlie), START_BALANCE);
+        vm.prank(bob);
+        escrow.joinChecked(ID, IMD, 25e18, alice);
+        assertEq(escrow.matches(ID).playerB, bob);
+        _settle(ID, bob, false);
+        assertEq(MockToken(IMD).balanceOf(bob), START_BALANCE + 22.5e18);
+        assertEq(MockToken(IMD).balanceOf(SPLITTER), 2.5e18);
+    }
+
+    function test_InviteeMayUsePlainJoinAndOpenMatchesStayPublic() public {
+        bytes32 publicId = keccak256("public match");
+        vm.prank(alice);
+        escrow.openInvite(ID, SHIFT, 100_000e18, bob);
+        _open(publicId, SHIFT, 100_000e18);
+        assertEq(escrow.matches(publicId).invitee, address(0));
+        _join(ID);
+        vm.prank(charlie);
+        escrow.join(publicId);
+        assertEq(escrow.matches(ID).playerB, bob);
+        assertEq(escrow.matches(publicId).playerB, charlie);
+    }
+
+    function test_OpenInviteRejectsZeroAndSelfInviteeAndUsedIds() public {
+        vm.startPrank(alice);
+        vm.expectRevert(PinballEscrow.InvalidInvitee.selector);
+        escrow.openInvite(ID, IMD, 1e18, address(0));
+        vm.expectRevert(PinballEscrow.InvalidInvitee.selector);
+        escrow.openInvite(ID, IMD, 1e18, alice);
+        vm.expectRevert(PinballEscrow.InvalidStake.selector);
+        escrow.openInvite(ID, IMD, 2e18, bob);
+        vm.expectRevert(PinballEscrow.UnsupportedToken.selector);
+        escrow.openInvite(ID, address(this), 1e18, bob);
+        escrow.openInvite(ID, IMD, 1e18, bob);
+        vm.expectRevert(PinballEscrow.MatchAlreadyExists.selector);
+        escrow.openInvite(ID, IMD, 1e18, charlie);
+        vm.stopPrank();
+        vm.expectRevert(PinballEscrow.MatchAlreadyExists.selector);
+        _open(ID, IMD, 1e18);
+        assertEq(MockToken(IMD).balanceOf(address(escrow)), 1e18);
+    }
+
+    function test_InviteOnlyOpenRefundsAndPausesLikeAPublicOpen() public {
+        vm.prank(alice);
+        escrow.openInvite(ID, IMD, 10e18, bob);
+        vm.prank(OWNER);
+        escrow.pause();
+        vm.prank(alice);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        escrow.openInvite(keccak256("paused invite"), IMD, 10e18, bob);
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        vm.prank(bob);
+        vm.expectRevert(PinballEscrow.JoinWindowClosed.selector);
+        escrow.join(ID);
+        escrow.refund(ID);
+        _assertState(ID, PinballEscrow.State.Refunded);
+        assertEq(MockToken(IMD).balanceOf(alice), START_BALANCE);
     }
 
     function test_CannotSettleUnjoinedMatch() public {
