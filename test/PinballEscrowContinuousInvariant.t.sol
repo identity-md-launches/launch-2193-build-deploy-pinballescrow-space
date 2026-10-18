@@ -25,7 +25,7 @@ contract PinballEscrowContinuousInvariantTest is EscrowTestBase {
             if (i < 3) handler.progress(i, false, 0, i + 1, 0);
         }
 
-        bytes4[] memory selectors = new bytes4[](7);
+        bytes4[] memory selectors = new bytes4[](9);
         selectors[0] = ContinuousEscrowHandler.progress.selector;
         selectors[1] = ContinuousEscrowHandler.rejectDeposit.selector;
         selectors[2] = ContinuousEscrowHandler.failPaymentThenRetry.selector;
@@ -33,6 +33,8 @@ contract PinballEscrowContinuousInvariantTest is EscrowTestBase {
         selectors[4] = ContinuousEscrowHandler.administer.selector;
         selectors[5] = ContinuousEscrowHandler.donate.selector;
         selectors[6] = ContinuousEscrowHandler.replayFinished.selector;
+        selectors[7] = ContinuousEscrowHandler.progressInvite.selector;
+        selectors[8] = ContinuousEscrowHandler.intrude.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
         targetContract(address(handler));
     }
@@ -84,5 +86,36 @@ contract PinballEscrowContinuousInvariantTest is EscrowTestBase {
         assertEq(handler.refunds(), 1);
         handler.drain();
         assertEq(handler.refunds(), 2);
+    }
+
+    /// @dev Deterministic witness that invite-only opens, checked joins and rejected intrusions are reachable.
+    function test_HandlerExercisesInvitesCheckedJoinsAndIntrusions() public {
+        // Slots 0-2 are joined, 3-5 open: settle slot 0 so progressInvite opens a fresh invite there.
+        handler.progress(0, false, 0, 0, 0);
+        handler.progressInvite(0, true, 2, 1, 2);
+        for (uint8 mismatch; mismatch < 3; ++mismatch) {
+            handler.intrude(0, mismatch, mismatch);
+            handler.intrude(3, mismatch, mismatch);
+        }
+        // The invitee's deposit can fail and roll back without losing the reserved slot.
+        handler.rejectDeposit(0, false, 0, 4, 0);
+        // Joins stay open while paused; invite-only opens are paused like public ones.
+        handler.administer(true, false);
+        handler.progressInvite(0, false, 0, 0, 0);
+        handler.progressInvite(3, false, 0, 1, 0);
+        handler.progressInvite(0, false, 0, 0, 1);
+        handler.progressInvite(0, false, 0, 0, 0);
+        handler.replayFinished(0);
+        handler.administer(false, true);
+        handler.progressInvite(0, false, 3, 2, 1);
+        handler.advanceTime(4);
+        handler.intrude(0, 0, 0); // Past the join window: no longer a live open.
+        handler.progressInvite(0, false, 0, 0, 2); // Unjoined invite refunds player A.
+        handler.checkAccounting();
+        assertEq(handler.invites(), 2);
+        assertEq(handler.checkedJoins(), 2);
+        assertEq(handler.rejectedIntrusions(), 6);
+        assertEq(handler.failedDeposits(), 1);
+        handler.drain();
     }
 }

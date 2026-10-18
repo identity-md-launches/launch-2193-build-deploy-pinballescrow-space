@@ -28,6 +28,7 @@ contract ContinuousEscrowHandler is Test {
         uint256 openedAt;
         uint256 joinedAt;
         PinballEscrow.State state;
+        address invitee;
     }
 
     struct Ledger {
@@ -56,6 +57,9 @@ contract ContinuousEscrowHandler is Test {
     uint256 public failedDeposits;
     uint256 public failedPayments;
     uint256 public rejectedReplays;
+    uint256 public invites;
+    uint256 public checkedJoins;
+    uint256 public rejectedIntrusions;
 
     constructor(PinballEscrow target, address[3] memory players, uint256 startingBalance) {
         escrow = target;
@@ -69,6 +73,17 @@ contract ContinuousEscrowHandler is Test {
 
     /// @dev Each selection advances one real lifecycle, replacing finished games with fresh IDs.
     function progress(uint8 slotSeed, bool shift, uint8 tier, uint8 actorSeed, uint8 outcomeSeed) public {
+        _progress(slotSeed, shift, tier, actorSeed, outcomeSeed, false);
+    }
+
+    /// @dev As progress, but a fresh slot opens invite-only and joins assert the agreed parameters.
+    function progressInvite(uint8 slotSeed, bool shift, uint8 tier, uint8 actorSeed, uint8 outcomeSeed) public {
+        _progress(slotSeed, shift, tier, actorSeed, outcomeSeed, true);
+    }
+
+    function _progress(uint8 slotSeed, bool shift, uint8 tier, uint8 actorSeed, uint8 outcomeSeed, bool invite)
+        private
+    {
         uint256 slot = slotSeed % SLOT_COUNT;
         Game storage game = games[slot];
         if (game.state == PinballEscrow.State.None || _terminal(game.state)) {
@@ -76,23 +91,30 @@ contract ContinuousEscrowHandler is Test {
             address token = shift ? SHIFT : IMD;
             uint256 stake = _stake(shift, tier);
             address a = actors[actorSeed % 3];
+            address invitee = invite ? _otherActor(a, outcomeSeed) : address(0);
             if (opensPaused) {
                 vm.expectRevert(Pausable.EnforcedPause.selector);
                 vm.prank(a);
-                escrow.open(id, token, stake);
+                if (invite) escrow.openInvite(id, token, stake, invitee);
+                else escrow.open(id, token, stake);
                 assertEq(uint256(escrow.matches(id).state), uint256(PinballEscrow.State.None));
                 return;
             }
             vm.prank(a);
-            escrow.open(id, token, stake);
-            games[slot] = Game(id, token, stake, a, address(0), vm.getBlockTimestamp(), 0, PinballEscrow.State.Open);
+            if (invite) escrow.openInvite(id, token, stake, invitee);
+            else escrow.open(id, token, stake);
+            games[slot] =
+                Game(id, token, stake, a, address(0), vm.getBlockTimestamp(), 0, PinballEscrow.State.Open, invitee);
             ledger[token].deposits += stake;
             playerBalances[token][a] -= stake;
             ++opens;
+            if (invite) ++invites;
         } else if (game.state == PinballEscrow.State.Open && vm.getBlockTimestamp() < game.openedAt + 1 hours) {
-            address b = _otherActor(game.a, actorSeed);
+            address b = _joiner(game, actorSeed);
             vm.prank(b);
-            escrow.join(game.id);
+            if (invite) escrow.joinChecked(game.id, game.token, game.stake, game.a);
+            else escrow.join(game.id);
+            if (invite) ++checkedJoins;
             game.b = b;
             game.joinedAt = vm.getBlockTimestamp();
             game.state = PinballEscrow.State.Joined;
@@ -111,7 +133,7 @@ contract ContinuousEscrowHandler is Test {
         bytes32 id = joining ? game.id : _newId();
         address token = joining ? game.token : shift ? SHIFT : IMD;
         uint256 stake = joining ? game.stake : _stake(shift, tier);
-        address player = joining ? _otherActor(game.a, actorSeed) : actors[actorSeed % 3];
+        address player = joining ? _joiner(game, actorSeed) : actors[actorSeed % 3];
         MockToken coin = MockToken(token);
         uint256 fault = faultSeed % 5;
         bytes memory reason;
@@ -199,6 +221,48 @@ contract ContinuousEscrowHandler is Test {
         finished.push(game);
     }
 
+    /// @dev Every ineligible join of a live open must revert and leave custody and the match untouched.
+    function intrude(uint8 slotSeed, uint8 actorSeed, uint8 mismatchSeed) public {
+        Game storage game = games[slotSeed % SLOT_COUNT];
+        if (game.state != PinballEscrow.State.Open || vm.getBlockTimestamp() >= game.openedAt + 1 hours) return;
+        bytes32 beforeMatch = keccak256(abi.encode(escrow.matches(game.id)));
+
+        vm.startPrank(game.a);
+        vm.expectRevert(PinballEscrow.CannotJoinOwnMatch.selector);
+        escrow.join(game.id);
+        vm.expectRevert(PinballEscrow.CannotJoinOwnMatch.selector);
+        escrow.joinChecked(game.id, game.token, game.stake, game.a);
+        vm.stopPrank();
+
+        if (game.invitee != address(0)) {
+            address outsider = actors[0] != game.a && actors[0] != game.invitee
+                ? actors[0]
+                : actors[1] != game.a && actors[1] != game.invitee ? actors[1] : actors[2];
+            vm.startPrank(outsider);
+            vm.expectRevert(PinballEscrow.NotInvited.selector);
+            escrow.join(game.id);
+            vm.expectRevert(PinballEscrow.NotInvited.selector);
+            escrow.joinChecked(game.id, game.token, game.stake, game.a);
+            vm.stopPrank();
+        }
+
+        // The eligible joiner names a different token, a different tier or a different opponent.
+        address token = game.token;
+        uint256 stake = game.stake;
+        address a = game.a;
+        uint256 mismatch = mismatchSeed % 3;
+        if (mismatch == 0) token = token == IMD ? SHIFT : IMD;
+        else if (mismatch == 1) stake = _stake(token == SHIFT, uint8(_tier(stake) + 1 + mismatchSeed % 3));
+        else a = _otherActor(a, actorSeed) == _joiner(game, actorSeed) ? address(this) : _otherActor(a, actorSeed);
+        vm.expectRevert(PinballEscrow.MatchMismatch.selector);
+        vm.prank(_joiner(game, actorSeed));
+        escrow.joinChecked(game.id, token, stake, a);
+
+        assertEq(keccak256(abi.encode(escrow.matches(game.id))), beforeMatch, "ineligible join changed match");
+        ++rejectedIntrusions;
+        checkAccounting();
+    }
+
     function advanceTime(uint8 intervalSeed) public {
         uint256[7] memory intervals = [uint256(0), 1, 17, 3599, 3600, 86_399, 86_400];
         vm.warp(vm.getBlockTimestamp() + intervals[intervalSeed % 7]);
@@ -236,6 +300,9 @@ contract ContinuousEscrowHandler is Test {
         vm.prank(_otherActor(game.a, 0));
         escrow.join(game.id);
         vm.expectRevert(PinballEscrow.InvalidState.selector);
+        vm.prank(game.invitee == address(0) ? _otherActor(game.a, 0) : game.invitee);
+        escrow.joinChecked(game.id, game.token, game.stake, game.a);
+        vm.expectRevert(PinballEscrow.InvalidState.selector);
         escrow.refund(game.id);
         uint256 deadline = vm.getBlockTimestamp() + 1 days;
         // Even a fresh signature from the current signer cannot revive a finished match.
@@ -245,6 +312,9 @@ contract ContinuousEscrowHandler is Test {
         vm.expectRevert(opensPaused ? Pausable.EnforcedPause.selector : PinballEscrow.MatchAlreadyExists.selector);
         vm.prank(game.a);
         escrow.open(game.id, game.token, game.stake);
+        vm.expectRevert(opensPaused ? Pausable.EnforcedPause.selector : PinballEscrow.MatchAlreadyExists.selector);
+        vm.prank(game.a);
+        escrow.openInvite(game.id, game.token, game.stake, _otherActor(game.a, 0));
         assertEq(keccak256(abi.encode(escrow.matches(game.id))), beforeMatch, "terminal match was modified");
         assertEq(uint256(escrow.matches(game.id).state), uint256(game.state));
         ++rejectedReplays;
@@ -262,6 +332,8 @@ contract ContinuousEscrowHandler is Test {
             assertEq(actual.playerB, game.b, "recorded B");
             assertEq(actual.openedAt, game.openedAt, "open time");
             assertEq(actual.joinedAt, game.joinedAt, "join time");
+            assertEq(actual.invitee, game.invitee, "recorded invitee");
+            if (game.invitee != address(0) && game.b != address(0)) assertEq(game.b, game.invitee, "invitee joined");
             assertEq(uint256(actual.state), uint256(game.state), "match phase");
             if (game.state == PinballEscrow.State.Open) obligations[game.token == IMD ? 0 : 1] += game.stake;
             if (game.state == PinballEscrow.State.Joined) obligations[game.token == IMD ? 0 : 1] += 2 * game.stake;
@@ -314,6 +386,17 @@ contract ContinuousEscrowHandler is Test {
 
     function _newId() private returns (bytes32) {
         return keccak256(abi.encode("continuous matches", nextId++));
+    }
+
+    function _joiner(Game storage game, uint8 seed) private view returns (address) {
+        return game.invitee != address(0) ? game.invitee : _otherActor(game.a, seed);
+    }
+
+    function _tier(uint256 stake) private pure returns (uint256) {
+        for (uint8 tier; tier < 4; ++tier) {
+            if (_stake(false, tier) == stake || _stake(true, tier) == stake) return tier;
+        }
+        revert("unknown stake");
     }
 
     function _otherActor(address a, uint8 seed) private view returns (address) {

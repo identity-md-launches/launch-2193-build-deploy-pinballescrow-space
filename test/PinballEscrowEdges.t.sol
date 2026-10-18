@@ -27,6 +27,58 @@ contract PinballEscrowEdgesTest is EscrowTestBase {
         }
     }
 
+    /// @dev Any non-zero invitee other than player A is the only possible player B, and only it can win.
+    function testFuzz_ArbitraryInviteeIsTheOnlyPossibleOpponent(
+        address invitee,
+        uint256 outsiderSeed,
+        bool shift,
+        uint8 tier,
+        uint256 joinDelaySeed
+    ) public {
+        address outsider = makeAddr(vm.toString(outsiderSeed));
+        // Addresses whose balances the test asserts on are remapped rather than discarded.
+        if (
+            invitee == address(0) || invitee == alice || invitee == outsider || invitee == SPLITTER
+                || invitee == address(escrow) || invitee == IMD || invitee == SHIFT
+        ) invitee = makeAddr("remapped invitee");
+        address token = shift ? SHIFT : IMD;
+        uint256 stake = _stake(shift, tier);
+        MockToken coin = MockToken(token);
+        vm.prank(alice);
+        escrow.openInvite(ID, token, stake, invitee);
+        coin.mint(outsider, stake);
+        vm.prank(outsider);
+        coin.approve(address(escrow), stake);
+        uint256 outsiderBalance = coin.balanceOf(outsider);
+
+        vm.warp(vm.getBlockTimestamp() + bound(joinDelaySeed, 0, 1 hours - 1));
+        vm.startPrank(outsider);
+        vm.expectRevert(PinballEscrow.NotInvited.selector);
+        escrow.join(ID);
+        vm.expectRevert(PinballEscrow.NotInvited.selector);
+        escrow.joinChecked(ID, token, stake, alice);
+        vm.stopPrank();
+        assertEq(coin.balanceOf(outsider), outsiderBalance);
+
+        coin.mint(invitee, stake);
+        vm.startPrank(invitee);
+        coin.approve(address(escrow), stake);
+        escrow.joinChecked(ID, token, stake, alice);
+        vm.stopPrank();
+        assertEq(escrow.matches(ID).playerB, invitee);
+
+        // A signed result naming the outsider can never pay out.
+        uint256 deadline = vm.getBlockTimestamp() + 1 hours;
+        bytes memory forOutsider = _signature(ID, outsider, false, deadline);
+        vm.expectRevert(PinballEscrow.InvalidWinner.selector);
+        escrow.settle(ID, outsider, false, deadline, forOutsider);
+        uint256 inviteeBalance = coin.balanceOf(invitee);
+        _settle(ID, invitee, false);
+        assertEq(coin.balanceOf(invitee), inviteeBalance + stake * 2 - stake / 10);
+        assertEq(coin.balanceOf(SPLITTER), stake / 10);
+        assertEq(coin.balanceOf(address(escrow)), 0);
+    }
+
     function _rejectStake(address token, uint256 stake) private {
         assertFalse(escrow.isAllowedStake(token, stake));
         vm.expectRevert(PinballEscrow.InvalidStake.selector);

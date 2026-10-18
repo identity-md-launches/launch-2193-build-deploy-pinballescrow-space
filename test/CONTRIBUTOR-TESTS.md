@@ -19,6 +19,9 @@ required.
   succeed when transfers recover. There are 56 deterministic failure/retry cases.
 - Malformed signature lengths cannot consume a joined match or prevent a subsequent
   correctly signed settlement.
+- For any fuzzed invitee address, outsiders cannot join an invite-only match through
+  `join` or `joinChecked` and lose no funds. A signed result naming an outsider is
+  rejected. The invitee's win pays exactly 95% of the pot and the splitter 5%.
 
 ## Continuous invariant campaign
 
@@ -28,7 +31,15 @@ This complements the existing handler, whose finite ID set tests attempted reuse
 
 The targeted actions advance lifecycles, inject failed deposits, fail and retry
 payments, advance time, pause/unpause and rotate the signer, donate tokens, and
-challenge retired IDs with fresh signatures and repeated calls. Expected failures
+challenge retired IDs with fresh signatures and repeated calls. Retired IDs are
+also challenged with `openInvite` and `joinChecked`.
+
+`progressInvite` opens invite-only matches (`openInvite`) and joins through
+`joinChecked`. Failed deposits on an invite-only match come from the invitee.
+`intrude` attacks every live open within its join window: player A joins through
+either entry point, a non-invitee joins an invite-only match, and the eligible
+joiner calls `joinChecked` with the wrong token, tier or opponent. Each attempt must
+revert with its specific error and leave the match and all balances unchanged. Expected failures
 assert specific errors. Unexpected handler reverts fail the campaign explicitly;
 the existing invariant now also sets this option in its test source.
 
@@ -39,12 +50,15 @@ player's balance. After each scheduled action the suite checks:
 2. Escrow token balances equal outstanding obligations plus voluntary donations.
 3. Each player's balance and the splitter's fees equal their independent ledgers.
 4. Token supply is conserved, and neither the owner nor the relayer receives funds.
-5. Recorded participants, token, stake, timestamps and match state remain correct.
+5. Recorded participants, invitee, token, stake, timestamps and match state remain
+   correct. Player B of an invite-only match is always the invitee.
 
 After every sequence, time advances and all remaining matches are refunded; only
 donations may remain. A deterministic handler test verifies that wins, draws,
 refunds, fresh IDs, all deposit fault modes, payment retries and replay attempts
-are reachable, including joins and exits while paused.
+are reachable, including joins and exits while paused. A second deterministic
+test reaches invite-only opens, checked joins, every intrusion, a failed invitee
+deposit, paused invite-only opens and an unjoined invite refund.
 
 ## Reproduction
 
