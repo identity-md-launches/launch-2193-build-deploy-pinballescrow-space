@@ -1,0 +1,18 @@
+[
+  {
+    "name": "openzeppelin-contracts",
+    "version": "v5.1.0",
+    "source": "https://codeload.github.com/OpenZeppelin/openzeppelin-contracts/tar.gz/refs/tags/v5.1.0",
+    "archive_sha256": "8a3b08cfc756437ba3343901565b18182adb42ec1e621960240a19da5d738686",
+    "retained_files": 28,
+    "selection": "Unmodified transitive imports of the application and ERC20 test mock, plus LICENSE."
+  },
+  {
+    "name": "forge-std",
+    "version": "v1.9.7",
+    "source": "https://codeload.github.com/foundry-rs/forge-std/tar.gz/refs/tags/v1.9.7",
+    "archive_sha256": "45157353ab49eab01d294565866731e599b32401757229689ee459aa26b7ee94",
+    "retained_files": 30,
+    "selection": "Unmodified src directory and MIT/Apache licenses."
+  }
+]
